@@ -84,7 +84,7 @@ where
 
     #[must_use]
     pub fn send(&mut self, value: T) -> FnStreamSend {
-        if let Some(_) = self.value.take() {
+        if self.value.take().is_some() {
             panic!(
                 "FnStreamSender can only send one value at a time. Previous send was not awaited"
             );
@@ -102,9 +102,7 @@ where
     T: Debug,
 {
     let value = Rc::new(Cell::new(None));
-
     let sender = FnStreamSender::new(value.clone());
-
     let fut = f(sender);
 
     FnStream { value, future: fut }
