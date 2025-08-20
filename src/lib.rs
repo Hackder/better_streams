@@ -2,15 +2,18 @@ use futures::Stream;
 use std::cell::Cell;
 use std::fmt::Debug;
 use std::future::Future;
-use std::rc::Rc;
+use std::sync::Arc;
 use std::task::Poll;
+
+type Value<T> = Arc<thread_local::ThreadLocal<Cell<Option<T>>>>;
 
 pin_project_lite::pin_project! {
     pub struct FnStream<T, Fut>
     where
         Fut: Future<Output = ()>,
+        T: Send,
     {
-        value: Rc<Cell<Option<T>>>,
+        value: Value<T>,
         #[pin]
         future: Fut,
     }
@@ -19,6 +22,7 @@ pin_project_lite::pin_project! {
 impl<T, Fut> Stream for FnStream<T, Fut>
 where
     Fut: Future<Output = ()>,
+    T: Send,
 {
     type Item = T;
 
@@ -33,7 +37,8 @@ where
         match Future::poll(future, cx) {
             Poll::Ready(()) => Poll::Ready(None),
             Poll::Pending => {
-                match this.value.take() {
+                let value_cell = this.value.get_or(|| Cell::new(None));
+                match value_cell.take() {
                     Some(value) => Poll::Ready(Some(value)),
                     None => {
                         // If no value is available, we return Pending
@@ -66,31 +71,28 @@ impl Future for FnStreamSend {
     }
 }
 
-pub struct FnStreamSender<'a, T> {
-    _lifetime: std::marker::PhantomData<&'a ()>,
-    value: Rc<Cell<Option<T>>>,
+pub struct FnStreamSender<T: Send> {
+    value: Value<T>,
 }
 
-impl<'a, T> FnStreamSender<'a, T>
+impl<T> FnStreamSender<T>
 where
-    T: Debug,
+    T: Send,
 {
-    pub fn new(value: Rc<Cell<Option<T>>>) -> Self {
-        Self {
-            _lifetime: std::marker::PhantomData,
-            value,
-        }
+    pub fn new(value: Value<T>) -> Self {
+        Self { value }
     }
 
     #[must_use]
     pub fn send(&mut self, value: T) -> FnStreamSend {
-        if self.value.take().is_some() {
+        let value_cell = self.value.get_or(|| Cell::new(None));
+        if value_cell.take().is_some() {
             panic!(
                 "FnStreamSender can only send one value at a time. Previous send was not awaited"
             );
         }
 
-        self.value.set(Some(value));
+        value_cell.set(Some(value));
 
         FnStreamSend { sent: false }
     }
@@ -98,14 +100,19 @@ where
 
 pub fn fn_stream<T, F>(f: F) -> FnStream<T, impl Future<Output = ()>>
 where
-    F: for<'a> AsyncFnOnce(FnStreamSender<'a, T>) -> (),
-    T: Debug,
+    F: for<'a> AsyncFnOnce(&'a mut FnStreamSender<T>) -> (),
+    T: Debug + Send,
 {
-    let value = Rc::new(Cell::new(None));
-    let sender = FnStreamSender::new(value.clone());
-    let fut = f(sender);
+    let value = Arc::new(thread_local::ThreadLocal::new());
+    let value_clone = Arc::clone(&value);
 
-    FnStream { value, future: fut }
+    FnStream {
+        value,
+        future: async move {
+            let mut sender = FnStreamSender::new(value_clone);
+            f(&mut sender).await;
+        },
+    }
 }
 
 #[cfg(test)]
@@ -114,9 +121,20 @@ mod tests {
 
     use super::*;
 
+    fn assert_send<T: Send>(_: T) {}
+
+    #[test]
+    fn fn_stream_send_is_send() {
+        let stream = fn_stream(async |sender| {
+            sender.send(1).await;
+        });
+
+        assert_send(stream);
+    }
+
     #[tokio::test]
     async fn single_send() {
-        let stream = fn_stream(async |mut sender| {
+        let stream = fn_stream(async |sender| {
             sender.send(1).await;
         });
 
@@ -128,7 +146,7 @@ mod tests {
 
     #[tokio::test]
     async fn multiple_sends() {
-        let stream = fn_stream(async |mut sender| {
+        let stream = fn_stream(async |sender| {
             sender.send(1).await;
             sender.send(2).await;
         });
@@ -142,7 +160,7 @@ mod tests {
 
     #[tokio::test]
     async fn future_between_sends() {
-        let stream = fn_stream(async |mut sender| {
+        let stream = fn_stream(async |sender| {
             sender.send(1).await;
             tokio::time::sleep(std::time::Duration::from_millis(1)).await;
             sender.send(2).await;
@@ -157,7 +175,7 @@ mod tests {
 
     #[tokio::test]
     async fn nested_fn_send() {
-        async fn nested(sender: &mut FnStreamSender<'_, i32>) {
+        async fn nested(sender: &mut FnStreamSender<i32>) {
             sender.send(2).await;
             tokio::time::sleep(std::time::Duration::from_millis(1)).await;
             sender.send(3).await;
@@ -185,7 +203,7 @@ mod tests {
             let b = 2;
             let a = &a;
             let b = &b;
-            let stream = fn_stream(async |mut sender| {
+            let stream = fn_stream(async |sender| {
                 sender.send(a).await;
                 sender.send(b).await;
             });
@@ -195,4 +213,21 @@ mod tests {
             assert_eq!(None, stream.next().await);
         });
     }
+
+    // #[tokio::test]
+    // async fn sender_cannot_leak_to_new_future() {
+    //     let stream = fn_stream(async |sender| {
+    //         sender.send(1).await;
+    //         let local_set = tokio::task::LocalSet::new();
+    //         local_set.spawn_local(async move {
+    //             sender.send(2).await;
+    //         });
+    //         tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+    //     });
+    //
+    //     pin_mut!(stream);
+    //
+    //     assert_eq!(stream.next().await, Some(1));
+    //     assert_eq!(stream.next().await, None);
+    // }
 }
